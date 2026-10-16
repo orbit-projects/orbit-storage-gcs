@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import tomllib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, BinaryIO
 
 import pytest
 from orbit import Application, ApplicationConfig
@@ -27,7 +30,17 @@ from orbit_storage import (
     StorageOperationError,
 )
 
-from orbit_storage_gcs import GCSConfig, GCSObjectStore, GCSObjectStorePlugin
+from orbit_storage_gcs import GCSConfig, GCSObjectStore
+from orbit_storage_gcs.plugin import GCSObjectStorePlugin
+
+
+def test_core_lifecycle_dependency_is_optional() -> None:
+    """The object store can be used without Core unless its plugin extra is installed."""
+    manifest = tomllib.loads(
+        (Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )["project"]
+    assert not any(dep.startswith("orbit-core") for dep in manifest["dependencies"])
+    assert manifest["optional-dependencies"]["core"] == ["orbit-core>=0.1.0a1,<0.2"]
 
 
 class FakeHTTPError(Exception):
@@ -67,20 +80,28 @@ class FakeClient:
         self.stream: FakeStream | None = None
         self.download_headers: dict[str, str] | None = None
         self.last_list_params: dict[str, str] | None = None
+        self.last_upload_force_resumable: bool | None = None
+        self.last_upload_spooled: bool = False
+        self.last_upload_file: BinaryIO | None = None
 
     async def upload(
-        self, bucket: str, object_name: str, file_data: bytes, **kwargs: Any
+        self, bucket: str, object_name: str, file_data: bytes | BinaryIO, **kwargs: Any
     ) -> dict[str, Any]:
+        self.last_upload_force_resumable = kwargs.get("force_resumable_upload")
+        self.last_upload_spooled = bool(getattr(file_data, "_rolled", False))
+        self.last_upload_file = file_data if hasattr(file_data, "read") else None
+        payload = file_data.read() if hasattr(file_data, "read") else file_data
+        assert isinstance(payload, bytes)
         resource = {
             "name": object_name,
-            "size": str(len(file_data)),
+            "size": str(len(payload)),
             "contentType": kwargs.get("content_type"),
             "etag": '"gcs-etag"',
             "updated": datetime.now(UTC).isoformat(),
             "generation": "123",
             "metadata": kwargs.get("metadata", {}),
         }
-        self.objects[object_name] = {"body": file_data, **resource}
+        self.objects[object_name] = {"body": payload, **resource}
         return resource
 
     async def download_metadata(self, bucket: str, object_name: str, **kwargs: Any) -> Any:
@@ -129,10 +150,85 @@ def make_store(client: FakeClient, **config: Any) -> GCSObjectStore:
 def test_config_rejects_invalid_transfer_limits() -> None:
     with pytest.raises(StorageConfigurationError, match="max_upload_bytes"):
         GCSConfig(bucket="bucket", max_upload_bytes=0)
+    with pytest.raises(StorageConfigurationError, match="max_concurrent_downloads"):
+        GCSConfig(bucket="bucket", max_concurrent_downloads=0)
     with pytest.raises(StorageConfigurationError, match="request_timeout_seconds"):
         GCSConfig(bucket="bucket", request_timeout_seconds=float("inf"))
     with pytest.raises(StorageConfigurationError, match="bucket"):
         GCSConfig(bucket="")
+    with pytest.raises(StorageConfigurationError, match="aggregate in-memory"):
+        GCSConfig(
+            bucket="bucket",
+            max_concurrent_uploads=128,
+            upload_memory_threshold_bytes=1024 * 1024,
+        )
+    with pytest.raises(StorageConfigurationError, match="max_retry_attempts"):
+        GCSConfig(bucket="bucket", max_retry_attempts=0)
+    with pytest.raises(StorageConfigurationError, match="cannot exceed"):
+        GCSConfig(
+            bucket="bucket",
+            retry_initial_delay_seconds=2,
+            retry_max_delay_seconds=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_idempotent_reads_retry_transient_failures_with_bounded_attempts() -> None:
+    class FlakyClient(FakeClient):
+        metadata_attempts = 0
+        list_attempts = 0
+
+        async def download_metadata(self, bucket: str, object_name: str, **kwargs: Any) -> Any:
+            self.metadata_attempts += 1
+            if self.metadata_attempts == 1:
+                raise FakeHTTPError(503)
+            return await super().download_metadata(bucket, object_name, **kwargs)
+
+        async def list_objects(self, bucket: str, **kwargs: Any) -> dict[str, Any]:
+            self.list_attempts += 1
+            if self.list_attempts == 1:
+                raise FakeHTTPError(429)
+            return await super().list_objects(bucket, **kwargs)
+
+    client = FlakyClient()
+    store = make_store(
+        client,
+        retry_initial_delay_seconds=0,
+        retry_max_delay_seconds=0,
+    )
+    await store.put("read-retry", b"ok")
+
+    result = await store.get("read-retry")
+    assert result is not None
+    await result.aclose()
+    page = await store.list_page()
+
+    assert [item.key for item in page.items] == ["read-retry"]
+    assert client.metadata_attempts == 2
+    assert client.list_attempts == 2
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_read_retries_stop_at_configured_attempt_limit() -> None:
+    class UnavailableClient(FakeClient):
+        attempts = 0
+
+        async def list_objects(self, bucket: str, **kwargs: Any) -> Any:
+            self.attempts += 1
+            raise FakeHTTPError(503)
+
+    client = UnavailableClient()
+    store = make_store(
+        client,
+        max_retry_attempts=2,
+        retry_initial_delay_seconds=0,
+        retry_max_delay_seconds=0,
+    )
+    with pytest.raises(StorageOperationError, match="listing failed"):
+        await store.list_page()
+    assert client.attempts == 2
+    await store.aclose()
 
 
 @pytest.mark.asyncio
@@ -157,6 +253,103 @@ async def test_put_get_delete_and_client_lifecycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_download_slots_bound_open_stream_lifetimes() -> None:
+    client = FakeClient()
+    store = make_store(client, max_concurrent_downloads=1)
+    await store.put("first", b"one")
+    await store.put("second", b"two")
+
+    first = await store.get("first")
+    assert first is not None
+    first_stream = client.stream
+    second_task = asyncio.create_task(store.get("second"))
+    await asyncio.sleep(0)
+    assert not second_task.done()
+
+    await first.aclose()
+    second = await asyncio.wait_for(second_task, timeout=1)
+    assert second is not None
+    assert first_stream is not None and first_stream.closed
+    await second.aclose()
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_download_releases_its_slot() -> None:
+    client = FakeClient()
+    store = make_store(client, max_concurrent_downloads=1)
+    assert await asyncio.wait_for(store.get("missing"), timeout=1) is None
+    await store.put("present", b"ok")
+    stored = await asyncio.wait_for(store.get("present"), timeout=1)
+    assert stored is not None
+    await stored.aclose()
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_body_read_closes_stream_and_releases_slot() -> None:
+    read_started = asyncio.Event()
+
+    class WaitingStream(FakeStream):
+        async def read(self, size: int = -1) -> bytes:
+            read_started.set()
+            await asyncio.Event().wait()
+            return b""
+
+    class WaitingClient(FakeClient):
+        async def download_stream(
+            self, bucket: str, object_name: str, **kwargs: Any
+        ) -> WaitingStream:
+            self.download_headers = kwargs.get("headers")
+            stream = WaitingStream(self.objects[object_name]["body"])
+            self.stream = stream
+            return stream
+
+    client = WaitingClient()
+    store = make_store(client, max_concurrent_downloads=1)
+    await store.put("waiting", b"data")
+    stored = await store.get("waiting")
+    assert stored is not None
+    body_task = asyncio.create_task(stored.body.__anext__())
+    await read_started.wait()
+    body_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await body_task
+
+    assert client.stream is not None and client.stream.closed
+    again = await asyncio.wait_for(store.get("waiting"), timeout=1)
+    assert again is not None
+    await again.aclose()
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_client_close_is_retryable_and_keeps_store_unavailable() -> None:
+    client = FakeClient()
+    store = make_store(client)
+    await store._get_client()
+    attempts = 0
+
+    async def fail_once() -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary close failure")
+        client.closed = True
+
+    client.close = fail_once
+    with pytest.raises(StorageOperationError, match="shutdown failed"):
+        await store.aclose()
+    with pytest.raises(StorageOperationError, match="closed"):
+        await store.put("after-close", b"value")
+
+    await store.aclose()
+
+    assert attempts == 2
+    assert client.closed
+
+
+@pytest.mark.asyncio
 async def test_streamed_upload_respects_payload_ceiling() -> None:
     client = FakeClient()
     store = make_store(client, max_upload_bytes=5)
@@ -168,6 +361,58 @@ async def test_streamed_upload_respects_payload_ceiling() -> None:
     with pytest.raises(StorageConfigurationError, match="maximum payload"):
         await store.put("too-large", chunks())
     assert client.objects == {}
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_streamed_upload_spills_to_disk_and_forces_resumable_sdk_path() -> None:
+    client = FakeClient()
+    store = make_store(
+        client,
+        upload_memory_threshold_bytes=3,
+        max_upload_bytes=32,
+    )
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"ab"
+        yield b"cde"
+        yield b"fghi"
+
+    result = await store.put("large-object", body(), metadata={"purpose": "test"})
+
+    assert result.size_bytes == 9
+    assert client.objects["large-object"]["body"] == b"abcdefghi"
+    assert client.last_upload_spooled
+    assert client.last_upload_force_resumable is True
+    await store.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_upload_closes_temporary_spool() -> None:
+    entered = asyncio.Event()
+
+    class WaitingClient(FakeClient):
+        async def upload(
+            self, bucket: str, object_name: str, file_data: bytes | BinaryIO, **kwargs: Any
+        ) -> dict[str, Any]:
+            self.last_upload_file = file_data if hasattr(file_data, "read") else None
+            entered.set()
+            await asyncio.Event().wait()
+
+    client = WaitingClient()
+    store = make_store(client, upload_memory_threshold_bytes=3)
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"abcdef"
+
+    task = asyncio.create_task(store.put("cancelled", body()))
+    await entered.wait()
+    assert client.last_upload_file is not None
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert client.last_upload_file.closed
     await store.aclose()
 
 
@@ -230,6 +475,8 @@ async def test_plugin_registers_store_and_closes_client() -> None:
     app.plugins.register(GCSObjectStorePlugin(store))
     await app.startup()
     assert await app.container.aresolve(OBJECT_STORE_DEPENDENCY_KEY) is store
+    result = await app.plugins.plugins[0].control_actions[0].handler({})
+    assert result is not None and result.summary == "GCS bucket listing is available."
     await store.put("lifecycle", b"initialized")
     await app.stop()
     assert client.closed

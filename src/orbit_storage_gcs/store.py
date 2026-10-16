@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import AsyncIterable, Callable, Mapping
+import random
+import tempfile
+from collections.abc import AsyncIterable, Awaitable, Callable, Mapping
 from contextlib import suppress
 from datetime import datetime
-from typing import Any, Protocol, cast
+from typing import Any, BinaryIO, Protocol, TypeVar, cast
 
 from gcloud.aio.storage import Storage
 from orbit_storage import (
@@ -36,12 +38,16 @@ from orbit_storage import (
 
 from orbit_storage_gcs.config import GCSConfig
 
+_T = TypeVar("_T")
+
 
 class _GCSClient(Protocol):
     """Narrow gcloud-aio interface used by this adapter and its deterministic tests."""
 
-    async def upload(self, bucket: str, object_name: str, file_data: bytes, **kwargs: Any) -> Any:
-        """Upload one bounded payload and return the provider object resource."""
+    async def upload(
+        self, bucket: str, object_name: str, file_data: bytes | BinaryIO, **kwargs: Any
+    ) -> Any:
+        """Upload bytes or a seekable binary stream and return the provider object resource."""
 
     async def download_metadata(self, bucket: str, object_name: str, **kwargs: Any) -> Any:
         """Fetch provider metadata without downloading the object body."""
@@ -73,10 +79,13 @@ class _StreamResponse(Protocol):
 class _GCSBodyReader:
     """Adapt the SDK's managed response stream to Orbit's explicitly closeable reader."""
 
-    def __init__(self, stream: _StreamResponse, chunk_size: int) -> None:
+    def __init__(
+        self, stream: _StreamResponse, chunk_size: int, release_slot: Callable[[], None]
+    ) -> None:
         """Take ownership of the entered provider response until close or EOF."""
         self._stream = stream
         self._chunk_size = chunk_size
+        self._release_slot = release_slot
         self._closed = False
 
     def __aiter__(self) -> _GCSBodyReader:
@@ -90,6 +99,8 @@ class _GCSBodyReader:
         try:
             chunk = await self._stream.read(self._chunk_size)
         except asyncio.CancelledError:
+            with suppress(BaseException):
+                await self.aclose()
             raise
         except Exception:
             await self.aclose()
@@ -107,17 +118,19 @@ class _GCSBodyReader:
     async def aclose(self) -> None:
         """Close the SDK response once, returning the connection to its pool."""
         if not self._closed:
+            self._closed = True
             try:
                 await self._stream.__aexit__(None, None, None)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 raise StorageOperationError("GCS response stream close failed.") from None
-            self._closed = True
+            finally:
+                self._release_slot()
 
 
 class GCSObjectStore(ObjectStore):
-    """Lifecycle-managed GCS adapter with bounded async upload buffering."""
+    """Lifecycle-managed GCS adapter with bounded-memory asynchronous uploads."""
 
     def __init__(
         self,
@@ -133,7 +146,9 @@ class GCSObjectStore(ObjectStore):
         self._client: _GCSClient | None = None
         self._client_lock = asyncio.Lock()
         self._upload_slots = asyncio.Semaphore(config.max_concurrent_uploads)
+        self._download_slots = asyncio.Semaphore(config.max_concurrent_downloads)
         self._closed = False
+        self._close_complete = False
 
     async def _get_client(self) -> _GCSClient:
         """Create one SDK client lazily and retain it until adapter shutdown."""
@@ -171,6 +186,36 @@ class GCSObjectStore(ObjectStore):
     def _not_found(cls, error: Exception) -> bool:
         """Recognize only the provider's explicit HTTP 404 response."""
         return cls._status(error) == 404
+
+    @classmethod
+    def _retryable(cls, error: Exception) -> bool:
+        """Classify transient GCS response and transport failures without exposing details."""
+        status = cls._status(error)
+        if status is not None:
+            return status in {408, 429, 500, 502, 503, 504}
+        # gcloud-aio uses aiohttp, but keep that transport an implementation detail. Native
+        # socket failures inherit OSError/TimeoutError; aiohttp-only connection errors are
+        # identified by their module without importing or pinning the transport package here.
+        return isinstance(error, (OSError, TimeoutError)) or type(error).__module__.startswith(
+            "aiohttp."
+        )
+
+    async def _read_request(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        """Retry an idempotent read with bounded full-jitter exponential backoff."""
+        for attempt in range(self.config.max_retry_attempts):
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if attempt + 1 >= self.config.max_retry_attempts or not self._retryable(error):
+                    raise
+                ceiling = min(
+                    self.config.retry_initial_delay_seconds * (2**attempt),
+                    self.config.retry_max_delay_seconds,
+                )
+                await asyncio.sleep(random.uniform(0, ceiling))
+        raise AssertionError("bounded retry loop exited without a result or exception")
 
     @staticmethod
     def _timestamp(value: object) -> datetime | None:
@@ -219,25 +264,51 @@ class GCSObjectStore(ObjectStore):
         except Exception:
             raise StorageOperationError("GCS returned invalid object metadata.") from None
 
-    async def _buffer(self, body: AsyncIterable[bytes]) -> bytes:
-        """Collect an async upload within its configured per-operation memory ceiling."""
-        data = bytearray()
+    async def _spool(self, body: AsyncIterable[bytes]) -> tuple[BinaryIO, int]:
+        """Copy an async upload into a bounded-memory, seekable temporary file.
+
+        The GCS SDK requires a seekable stream to determine content length for resumable uploads.
+        Writes run in a worker thread in bounded slices, so the producer is
+        backpressured by disk I/O and payload size does not determine resident memory use.
+        """
+        try:
+            raw_spool = tempfile.SpooledTemporaryFile(  # noqa: SIM115 - closed after upload.
+                max_size=self.config.upload_memory_threshold_bytes,
+                mode="w+b",
+            )  # noqa: SIM115 - lifetime transfers to put() and is closed in its finally block.
+            spool = cast(BinaryIO, raw_spool)
+        except Exception:
+            raise StorageOperationError("GCS upload spool could not be created.") from None
+        total = 0
         try:
             async for chunk in body:
                 if not isinstance(chunk, bytes):
                     raise StorageConfigurationError("GCS upload streams must yield byte chunks.")
-                if len(data) + len(chunk) > self.config.max_upload_bytes:
+                if total + len(chunk) > self.config.max_upload_bytes:
                     raise StorageConfigurationError(
                         "GCS upload exceeds the configured maximum payload size."
                     )
-                data.extend(chunk)
+                view = memoryview(chunk)
+                for offset in range(0, len(view), self.config.read_chunk_size):
+                    await _blocking_call(
+                        spool.write,
+                        view[offset : offset + self.config.read_chunk_size],
+                    )
+                total += len(chunk)
+            await _blocking_call(spool.seek, 0)
         except asyncio.CancelledError:
+            with suppress(Exception):
+                await _blocking_call(spool.close)
             raise
         except StorageConfigurationError:
+            with suppress(Exception):
+                await _blocking_call(spool.close)
             raise
         except Exception:
+            with suppress(Exception):
+                await _blocking_call(spool.close)
             raise StorageOperationError("GCS upload stream could not be read.") from None
-        return bytes(data)
+        return spool, total
 
     async def put(
         self,
@@ -259,38 +330,51 @@ class GCSObjectStore(ObjectStore):
         except Exception:
             raise StorageConfigurationError("GCS upload metadata is invalid.") from None
         async with self._upload_slots:
+            spool: BinaryIO | None = None
+            payload: bytes | BinaryIO
             if isinstance(body, bytes):
                 payload = body
+                payload_size = len(body)
             elif hasattr(body, "__aiter__"):
-                payload = await self._buffer(body)
+                spool, payload_size = await self._spool(body)
+                payload = spool
             else:
                 raise StorageConfigurationError(
                     "GCS upload body must be bytes or an async byte stream."
                 )
-            if len(payload) > self.config.max_upload_bytes:
+            if payload_size > self.config.max_upload_bytes:
+                if spool is not None:
+                    await _close_spool(spool)
                 raise StorageConfigurationError(
                     "GCS upload exceeds the configured maximum payload size."
                 )
-            client = await self._get_client()
             try:
-                response = await client.upload(
-                    self.config.bucket,
-                    object_key,
-                    payload,
-                    content_type=validated.content_type,
-                    metadata=dict(validated.metadata),
-                    timeout=math.ceil(self.config.request_timeout_seconds),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise StorageOperationError("GCS upload operation failed.") from None
+                client = await self._get_client()
+                try:
+                    response = await client.upload(
+                        self.config.bucket,
+                        object_key,
+                        payload,
+                        content_type=validated.content_type,
+                        metadata=dict(validated.metadata),
+                        force_resumable_upload=True
+                        if spool is not None or validated.metadata
+                        else None,
+                        timeout=math.ceil(self.config.request_timeout_seconds),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise StorageOperationError("GCS upload operation failed.") from None
+            finally:
+                if spool is not None:
+                    await _close_spool(spool)
         if not isinstance(response, Mapping):
             raise StorageOperationError("GCS upload returned an invalid object response.")
         return self._info(
             object_key,
             response,
-            fallback_size=len(payload),
+            fallback_size=payload_size,
             fallback_content_type=validated.content_type,
             fallback_metadata=validated.metadata,
         )
@@ -298,56 +382,83 @@ class GCSObjectStore(ObjectStore):
     async def get(self, key: str) -> StoredObject | None:
         """Return metadata with a generation-pinned, closeable GCS download stream."""
         object_key = self._key(key)
-        client = await self._get_client()
+        await self._download_slots.acquire()
+        slot_transferred = False
         try:
-            raw = await client.download_metadata(
-                self.config.bucket,
-                object_key,
-                timeout=math.ceil(self.config.request_timeout_seconds),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            if self._not_found(error):
-                return None
-            raise StorageOperationError("GCS object metadata request failed.") from None
-        if not isinstance(raw, Mapping):
-            raise StorageOperationError("GCS returned invalid object metadata.")
-        info = self._info(object_key, raw)
-        generation = raw.get("generation")
-        headers: dict[str, str] = {}
-        if generation is not None:
-            if not isinstance(generation, (str, int)) or isinstance(generation, bool):
-                raise StorageOperationError("GCS returned invalid object generation metadata.")
-            generation_value = str(generation)
-            if not generation_value.isdecimal():
-                raise StorageOperationError("GCS returned invalid object generation metadata.")
-            headers["x-goog-if-generation-match"] = generation_value
-        stream: _StreamResponse | None = None
-        try:
-            stream = cast(
-                _StreamResponse,
-                await client.download_stream(
-                    self.config.bucket,
-                    object_key,
-                    headers=headers,
-                    timeout=math.ceil(self.config.request_timeout_seconds),
+            client = await self._get_client()
+            try:
+                raw = await self._read_request(
+                    lambda: client.download_metadata(
+                        self.config.bucket,
+                        object_key,
+                        timeout=math.ceil(self.config.request_timeout_seconds),
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if self._not_found(error):
+                    return None
+                raise StorageOperationError("GCS object metadata request failed.") from None
+            if not isinstance(raw, Mapping):
+                raise StorageOperationError("GCS returned invalid object metadata.")
+            info = self._info(object_key, raw)
+            generation = raw.get("generation")
+            headers: dict[str, str] = {}
+            if generation is not None:
+                if not isinstance(generation, (str, int)) or isinstance(generation, bool):
+                    raise StorageOperationError("GCS returned invalid object generation metadata.")
+                generation_value = str(generation)
+                if not generation_value.isdecimal():
+                    raise StorageOperationError("GCS returned invalid object generation metadata.")
+                headers["x-goog-if-generation-match"] = generation_value
+            stream: _StreamResponse | None = None
+
+            async def open_stream() -> _StreamResponse:
+                nonlocal stream
+                candidate = cast(
+                    _StreamResponse,
+                    await client.download_stream(
+                        self.config.bucket,
+                        object_key,
+                        headers=headers,
+                        timeout=math.ceil(self.config.request_timeout_seconds),
+                    ),
+                )
+                try:
+                    await candidate.__aenter__()
+                except BaseException:
+                    with suppress(BaseException):
+                        await candidate.__aexit__(None, None, None)
+                    raise
+                stream = candidate
+                return candidate
+
+            try:
+                stream = await self._read_request(open_stream)
+            except asyncio.CancelledError:
+                if stream is not None:
+                    with suppress(Exception):
+                        await stream.__aexit__(None, None, None)
+                raise
+            except Exception as error:
+                if stream is not None:
+                    with suppress(Exception):
+                        await stream.__aexit__(None, None, None)
+                if self._not_found(error):
+                    return None
+                raise StorageOperationError("GCS object download could not be opened.") from None
+            stored = StoredObject(
+                info=info,
+                body=_GCSBodyReader(
+                    stream, self.config.read_chunk_size, self._download_slots.release
                 ),
             )
-            await stream.__aenter__()
-        except asyncio.CancelledError:
-            if stream is not None:
-                with suppress(Exception):
-                    await stream.__aexit__(None, None, None)
-            raise
-        except Exception as error:
-            if stream is not None:
-                with suppress(Exception):
-                    await stream.__aexit__(None, None, None)
-            if self._not_found(error):
-                return None
-            raise StorageOperationError("GCS object download could not be opened.") from None
-        return StoredObject(info=info, body=_GCSBodyReader(stream, self.config.read_chunk_size))
+            slot_transferred = True
+            return stored
+        finally:
+            if not slot_transferred:
+                self._download_slots.release()
 
     async def delete(self, key: str) -> bool:
         """Delete an object and return false only when GCS reports it missing."""
@@ -386,10 +497,12 @@ class GCSObjectStore(ObjectStore):
             params["pageToken"] = request.continuation_token
         client = await self._get_client()
         try:
-            response = await client.list_objects(
-                self.config.bucket,
-                params=params,
-                timeout=math.ceil(self.config.request_timeout_seconds),
+            response = await self._read_request(
+                lambda: client.list_objects(
+                    self.config.bucket,
+                    params=params,
+                    timeout=math.ceil(self.config.request_timeout_seconds),
+                )
             )
             if not isinstance(response, Mapping):
                 raise ValueError
@@ -413,19 +526,45 @@ class GCSObjectStore(ObjectStore):
             ) from None
 
     async def aclose(self) -> None:
-        """Close the owned Google client once; repeated shutdown calls are harmless."""
+        """Reject new work and close the owned Google client, retaining retry state on failure."""
         async with self._client_lock:
-            if self._closed:
+            if self._close_complete:
                 return
             self._closed = True
             if self._client is not None:
                 try:
                     await self._client.close()
                 except asyncio.CancelledError:
-                    self._closed = False
                     raise
                 except Exception:
                     raise StorageOperationError("GCS client shutdown failed.") from None
+            self._close_complete = True
+
+
+async def _blocking_call(function: Callable[..., _T], *args: Any) -> _T:
+    """Run one file operation off-loop and drain it before propagating cancellation."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        with suppress(BaseException):
+            task.result()
+        raise asyncio.CancelledError
+    return task.result()
+
+
+async def _close_spool(spool: BinaryIO) -> None:
+    """Close temporary upload storage without leaking operating-system exceptions."""
+    try:
+        await _blocking_call(spool.close)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise StorageOperationError("GCS upload spool cleanup failed.") from None
 
 
 __all__ = ["GCSObjectStore"]

@@ -14,7 +14,6 @@
 """Optional Google Cloud Storage adapter for Orbit's storage capability."""
 
 from orbit_storage_gcs.config import GCSConfig
-from orbit_storage_gcs.plugin import GCSObjectStorePlugin
 from orbit_storage_gcs.store import GCSObjectStore
 
-__all__ = ["GCSConfig", "GCSObjectStore", "GCSObjectStorePlugin"]
+__all__ = ["GCSConfig", "GCSObjectStore"]

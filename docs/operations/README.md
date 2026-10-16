@@ -16,12 +16,15 @@ Use the package README's constructor and deployment examples. Store credentials 
 capability. It is a separate package and is not installed with Orbit Core or `orbit-storage`.
 
 ```bash
-pip install orbit-core orbit-storage orbit-storage-gcs
+pip install orbit-storage orbit-storage-gcs
+# Add the Core lifecycle plugin only when using it:
+pip install 'orbit-storage-gcs[core]'
 ```
 
 ```python
 from orbit import Application, ApplicationConfig
-from orbit_storage_gcs import GCSConfig, GCSObjectStore, GCSObjectStorePlugin
+from orbit_storage_gcs import GCSConfig, GCSObjectStore
+from orbit_storage_gcs.plugin import GCSObjectStorePlugin
 
 application = Application(ApplicationConfig(name="orders"))
 store = GCSObjectStore(GCSConfig(bucket="orders-data"))
@@ -32,14 +35,28 @@ The adapter uses `gcloud-aio-storage` for asynchronous GCS operations and relies
 Application Default Credentials chain unless `service_file` is explicitly configured. The plugin
 registers the store under `orbit-storage`'s shared dependency key and closes its client during
 application shutdown. No GCS SDK or cloud credentials are added to Core or the capability package.
+Shutdown rejects new requests immediately. If client close fails or is cancelled, a later `aclose()`
+retries cleanup while keeping the store unavailable for new operations.
 
-Byte uploads and async-iterable uploads are both supported. Streamed uploads are collected into a
-bounded buffer before transfer because the selected SDK accepts a bytes or file-like payload rather
-than Orbit's async iterator; configure `max_upload_bytes` and `max_concurrent_uploads` to bound
-aggregate memory use. Downloads are streamed and the returned `StoredObject` must be used as an
-async context manager or explicitly closed. Reads use the object's GCS generation as a precondition,
+Byte uploads and async-iterable uploads are both supported. The GCS SDK requires a seekable stream
+to determine content length for resumable transfers, so async sources are written to a
+spooled temporary file in bounded chunks. `upload_memory_threshold_bytes` controls the per-upload
+memory threshold; its product with `max_concurrent_uploads` is capped at 64 MiB. Larger streams
+spill to the process temporary directory and use the SDK resumable-upload path. `max_upload_bytes`
+bounds each stream, so maximum temporary disk use is bounded by that value multiplied by concurrent
+uploads. Configure the temp directory with sufficient ephemeral disk quota. Downloads are streamed
+and limited by `max_concurrent_downloads` (default 16, maximum 256). A slot remains occupied for the
+entire open response lifetime; the returned `StoredObject` must be used as an async context manager
+or explicitly closed so the connection and slot are released. Close active objects before shutting
+down the store. Reads use the object's GCS generation as a precondition,
 so an object replacement between metadata lookup and data transfer fails instead of silently
 returning mismatched metadata and bytes.
+
+Idempotent metadata reads, list-page reads, and download-stream opening use bounded retries for
+timeouts, connection failures, throttling, and selected transient server statuses. Configure
+`max_retry_attempts` (including the initial attempt), `retry_initial_delay_seconds`, and
+`retry_max_delay_seconds` to tune full-jitter exponential backoff. Streaming body reads, uploads,
+and deletes are not automatically retried. The SDK deliberately leaves retries to callers.
 
 Listing uses GCS page tokens, which are opaque and specific to this adapter and bucket. The
 provider's metadata, versioning, retention, encryption, IAM, and consistency behavior remain GCS
@@ -51,7 +68,7 @@ The generation precondition used to keep metadata and downloaded bytes aligned f
 
 ## Status
 
-This package is pre-alpha; its public API is not stable and it is not yet published. It supports
+This package is alpha; its public API is not stable and it is not yet published. It supports
 Python 3.11 through 3.14. Licensed under Apache-2.0.
 
 ## Production validation

@@ -13,8 +13,10 @@
 # limitations under the License.
 """Optional Core plugin that registers and owns the GCS object-store adapter."""
 
+from collections.abc import Mapping
+
 from orbit import Application
-from orbit.plugins import Plugin, PluginMetadata
+from orbit.plugins import ControlAction, ControlResult, Plugin, PluginMetadata
 from orbit_storage import OBJECT_STORE_DEPENDENCY_KEY
 
 from orbit_storage_gcs.store import GCSObjectStore
@@ -34,6 +36,14 @@ class GCSObjectStorePlugin(Plugin):
         if not isinstance(store, GCSObjectStore):
             raise TypeError("GCSObjectStorePlugin requires a GCSObjectStore instance.")
         self.store = store
+        self.control_actions = (
+            ControlAction(
+                id="check-connection",
+                title="Check GCS bucket access",
+                description="List at most one object to verify access to the configured bucket.",
+                handler=self._check_connection,
+            ),
+        )
 
     def setup(self, application: Application) -> None:
         """Expose the provider implementation through Orbit Storage's stable key."""
@@ -44,6 +54,11 @@ class GCSObjectStorePlugin(Plugin):
     async def deactivate(self) -> None:
         """Close the asynchronous Google client during shutdown or startup rollback."""
         await self.store.aclose()
+
+    async def _check_connection(self, _: Mapping[str, object]) -> ControlResult:
+        """Issue one bounded read-only list request without displaying object names."""
+        await self.store.list_page(limit=1)
+        return ControlResult("GCS bucket listing is available.")
 
 
 __all__ = ["GCSObjectStorePlugin"]
